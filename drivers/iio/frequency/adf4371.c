@@ -116,6 +116,14 @@
 #define ADF4371_FB_SEL_MSK		BIT(7)
 #define ADF4371_FB_SEL(x)		FIELD_PREP(ADF4371_FB_SEL_MSK, x)
 
+/* ADF4371_REG25 */
+#define ADF4371_RF_EN_MSK		BIT(2)
+#define ADF4371_RF_EN(x)		FIELD_PREP(ADF4371_RF_EN_MSK, x)
+#define ADF4371_X2_EN_MSK		BIT(3)
+#define ADF4371_X2(x)			FIELD_PREP(ADF4371_X2_EN_MSK, x)
+#define ADF4371_X4_EN_MSK		BIT(4)
+#define ADF4371_X4(x)			FIELD_PREP(ADF4371_X4_EN_MSK, x)
+
 /* ADF4371_REG32 */
 #define ADF4371_TIMEOUT_MSK		GENMASK(1, 0)
 #define ADF4371_TIMEOUT(x)		FIELD_PREP(ADF4371_TIMEOUT_MSK, x)
@@ -123,6 +131,10 @@
 /* ADF4371_REG34 */
 #define ADF4371_VCO_ALC_TOUT_MSK	GENMASK(4, 0)
 #define ADF4371_VCO_ALC_TOUT(x)		FIELD_PREP(ADF4371_VCO_ALC_TOUT_MSK, x)
+
+/* ADF4371_REG72 */
+#define ADF4731_PDB_AUX_MSK		BIT(3)
+#define ADF4371_PDB_AUX(x)		FIELD_PREP(ADF4731_PDB_AUX_MSK, x)
 
 /* Specifications */
 #define ADF4371_MIN_VCO_FREQ		4000000000ULL /* 4000 MHz */
@@ -150,7 +162,20 @@ enum {
 enum {
 	ADF4371_CH_RF8,
 	ADF4371_CH_RF16,
-	ADF4371_CH_RF32
+	ADF4371_CH_RF32,
+	ADF4371_CH_RFAUX8
+};
+
+struct adf4371_pwrdown {
+	unsigned int reg;
+	unsigned int bit;
+};
+
+static const struct adf4371_pwrdown adf4371_pwrdown_ch[4] = {
+	[ADF4371_CH_RF8] = { ADF4371_REG25, 2 },
+	[ADF4371_CH_RF16] = { ADF4371_REG25, 3 },
+	[ADF4371_CH_RF32] = { ADF4371_REG25, 4 },
+	[ADF4371_CH_RFAUX8] = { ADF4371_REG72, 3 }
 };
 
 static const struct reg_sequence adf4371_reg_defaults[] = {
@@ -215,7 +240,7 @@ static unsigned long long adf4371_pll_fract_n_get_rate(struct adf4371_state *st,
 	do_div(tmp, st->mod2);
 	val += tmp + ADF4371_MODULUS1 / 2;
 
-	if (channel == ADF4371_CH_RF8)
+	if (channel == ADF4371_CH_RF8 || channel == ADF4371_CH_RFAUX8)
 		ref_div_sel = st->rf_div_sel;
 	else
 		ref_div_sel = 0;
@@ -268,6 +293,7 @@ static int adf4371_set_freq(struct adf4371_state *st, unsigned long long freq,
 
 	switch(channel) {
 	case ADF4371_CH_RF8:
+	case ADF4371_CH_RFAUX8:
 		if ((freq > ADF4371_MAX_OUT_FREQ) ||
 		    (freq < ADF4371_MIN_OUT_FREQ))
 			return -EINVAL;
@@ -357,8 +383,8 @@ static ssize_t adf4371_read(struct iio_dev *indio_dev,
 			    char *buf)
 {
 	struct adf4371_state *st = iio_priv(indio_dev);
-	unsigned long long val;
-	unsigned int readval;
+	unsigned long long val = 0;
+	unsigned int readval, reg, bit;
 	int ret;
 
 	mutex_lock(&indio_dev->mlock);
@@ -368,10 +394,21 @@ static ssize_t adf4371_read(struct iio_dev *indio_dev,
 		ret = regmap_read(st->regmap, ADF4371_REG7C, &readval);
 		if (ret < 0)
 			break;
+
 		if (readval == 0x00) {
 			dev_dbg(&st->spi->dev, "PLL un-locked\n");
 			ret = -EBUSY;
 		}
+		break;
+	case ADF4371_POWER_DOWN:
+		reg = adf4371_pwrdown_ch[chan->channel].reg;
+		bit = adf4371_pwrdown_ch[chan->channel].bit;
+
+		ret = regmap_read(st->regmap, reg, &readval);
+		if (ret < 0)
+			break;
+
+		val = !(readval & BIT(bit));
 		break;
 	default:
 		ret = -EINVAL;
@@ -389,6 +426,7 @@ static ssize_t adf4371_write(struct iio_dev *indio_dev,
 {
 	struct adf4371_state *st = iio_priv(indio_dev);
 	unsigned long long readin;
+	unsigned int bit, readval, reg;
 	int ret;
 
 	ret = kstrtoull(buf, 10, &readin);
@@ -399,6 +437,18 @@ static ssize_t adf4371_write(struct iio_dev *indio_dev,
 	switch ((u32)private) {
 	case ADF4371_FREQ:
 		ret = adf4371_set_freq(st, readin, chan->channel);
+		break;
+	case ADF4371_POWER_DOWN:
+		reg = adf4371_pwrdown_ch[chan->channel].reg;
+		bit = adf4371_pwrdown_ch[chan->channel].bit;
+		ret = regmap_read(st->regmap, reg, &readval);
+		if (ret < 0)
+			break;
+
+		readval &= ~BIT(bit);
+		readval |= (!!!readin << bit);
+
+		ret = regmap_write(st->regmap, reg, readval);
 		break;
 	default:
 		ret = -EINVAL;
@@ -426,18 +476,20 @@ static const struct iio_chan_spec_ext_info adf4371_ext_info[] = {
 	{ },
 };
 
-#define ADF4371_CHANNEL(index) { \
+#define ADF4371_CHANNEL(_name, index) { \
 		.type = IIO_ALTVOLTAGE, \
 		.indexed = 1, \
 		.output = 1, \
 		.channel = index, \
 		.ext_info = adf4371_ext_info, \
+		.extend_name = _name, \
 	}
 
 static const struct iio_chan_spec adf4371_chan[] = {
-	ADF4371_CHANNEL(ADF4371_CH_RF8),
-	ADF4371_CHANNEL(ADF4371_CH_RF16),
-	ADF4371_CHANNEL(ADF4371_CH_RF32),
+	ADF4371_CHANNEL("rf8", ADF4371_CH_RF8),
+	ADF4371_CHANNEL("rf16", ADF4371_CH_RF16),
+	ADF4371_CHANNEL("rf32", ADF4371_CH_RF32),
+	ADF4371_CHANNEL("rfaux8", ADF4371_CH_RFAUX8),
 };
 
 static int adf4371_reg_access(struct iio_dev *indio_dev,
